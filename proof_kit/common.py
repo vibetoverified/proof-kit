@@ -1,6 +1,7 @@
 """Shared helpers: config loading, running checks, git state. Standard library only, Python 3.9+."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -187,6 +188,83 @@ def git_has_changes(root: Path) -> Optional[bool]:
         return None
     lines = [l for l in proc.stdout.splitlines() if l[3:].split("/")[0] != STATE_DIR]
     return bool(lines)
+
+
+def _git(root: Path, *args: str) -> Optional[bytes]:
+    try:
+        proc = subprocess.run(["git", *args], cwd=root, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+UNTRACKED_HASH_LIMIT = 5_000_000  # bytes; bigger untracked files count by name and size only
+
+
+def tree_fingerprint(root: Path) -> Optional[str]:
+    """A hash of the project's working-tree state: tracked changes plus untracked files and their contents.
+
+    Same hash = nothing changed. None when git isn't available or the folder isn't in a repo.
+    Scoped to the project folder and ignores .proof/ (Proof Kit's own state).
+    """
+    spec = ["--", ".", f":(exclude){STATE_DIR}"]
+    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", *spec)
+    if status is None:
+        return None
+    h = hashlib.sha256(status)
+    diff = _git(root, "diff", "HEAD", "--binary", *spec)
+    if diff is None:  # no commits yet: compare index and worktree instead
+        diff = (_git(root, "diff", "--binary", *spec) or b"") + (_git(root, "diff", "--cached", "--binary", *spec) or b"")
+    h.update(diff)
+    for rel in (_git(root, "ls-files", "--others", "--exclude-standard", "-z", *spec) or b"").split(b"\0"):
+        if not rel:
+            continue
+        path = root / rel.decode("utf-8", "surrogateescape")
+        try:
+            size = path.stat().st_size
+            h.update(rel + str(size).encode())
+            if path.is_file() and size <= UNTRACKED_HASH_LIMIT:
+                h.update(path.read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()
+
+
+BASELINE_DAYS = 7
+
+
+def baseline_path(root: Path) -> Path:
+    return root / STATE_DIR / "baseline.json"
+
+
+def load_baselines(root: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(baseline_path(root).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_baseline(root: Path, session: str, fingerprint: str) -> None:
+    """Remember the tree state at the start of this turn; drop entries older than BASELINE_DAYS."""
+    now = time.time()
+    data = {k: v for k, v in load_baselines(root).items()
+            if isinstance(v, dict) and now - float(v.get("t", 0)) < BASELINE_DAYS * 86400}
+    data[session] = {"fingerprint": fingerprint, "t": now}
+    path = baseline_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def changed_this_turn(root: Path, session: str) -> Optional[bool]:
+    """True/False when this turn has a baseline and git works; None when we can't tell."""
+    entry = load_baselines(root).get(session)
+    if not isinstance(entry, dict) or not entry.get("fingerprint"):
+        return None
+    now = tree_fingerprint(root)
+    if now is None:
+        return None
+    return now != entry["fingerprint"]
 
 
 def state_path(root: Path) -> Path:

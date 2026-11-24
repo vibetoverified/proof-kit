@@ -30,6 +30,7 @@ KIT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NPM_TEST = 'echo "Error: no test specified" && exit 1'
 HOOK_DIR = "${CLAUDE_PROJECT_DIR}/.claude/proof-kit/proof_kit/"
 HOOK_ARG = HOOK_DIR + "verify_before_stop.py"
+TURN_ARG = HOOK_DIR + "turn_start.py"
 GUARD_TIMEOUT = 30
 # (event, matcher, script) for the full edition's guards
 GUARDS = (
@@ -192,7 +193,7 @@ def render_config(checks: Dict[str, str], full: bool = True) -> str:
         "[stop_hook]",
         "enabled = true",
         "max_attempts = 3        # after this many blocked rounds, hand back to the human",
-        "only_if_changed = true  # skip when no files changed",
+        "only_if_changed = true  # skip when nothing changed during the turn",
         "timeout_seconds = 300   # per check",
         "",
     ]
@@ -219,7 +220,7 @@ def merge_hooks(settings_path: Path, python: str, timeout: int, full: bool) -> D
     except (OSError, ValueError):
         settings = {}
     hooks = settings.setdefault("hooks", {})
-    for event in ("Stop", "PostToolUse", "PreToolUse"):
+    for event in ("UserPromptSubmit", "Stop", "PostToolUse", "PreToolUse"):
         groups: List[Dict] = hooks.get(event, [])
         for group in groups:
             group["hooks"] = [h for h in group.get("hooks", []) if not _is_ours(h)]
@@ -228,6 +229,9 @@ def merge_hooks(settings_path: Path, python: str, timeout: int, full: bool) -> D
             hooks[event] = groups
         else:
             hooks.pop(event, None)
+    hooks.setdefault("UserPromptSubmit", []).append({"hooks": [{
+        "type": "command", "command": python, "args": [TURN_ARG], "timeout": GUARD_TIMEOUT,
+    }]})
     hooks.setdefault("Stop", []).append({"hooks": [{
         "type": "command", "command": python, "args": [HOOK_ARG], "timeout": timeout,
     }]})
@@ -318,7 +322,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     print("Added the hooks to .claude/settings.local.json: "
-          + ("Stop (checks), PostToolUse (tamper guard), PreToolUse (secrets guard)" if full else "Stop (checks)"))
+          + ("UserPromptSubmit (turn start), Stop (checks), PostToolUse (tamper guard), PreToolUse (secrets guard)"
+             if full else "UserPromptSubmit (turn start), Stop (checks)"))
 
     if args.ci and full:
         workflow = root / ".github" / "workflows" / "proof.yml"

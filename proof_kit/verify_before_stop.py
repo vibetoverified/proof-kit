@@ -7,7 +7,8 @@ Exit codes (Claude Code hook contract):
     2  block stopping; stderr is shown to the agent so it keeps working and fixes the failures
 
 Safety:
-    - Only blocks when files changed in the working tree (configurable).
+    - Only runs the checks when files changed during this turn (turn_start.py records the state when the
+      prompt arrives). Without that record it falls back to "the working tree has changes". Configurable.
     - Gives up after max_attempts blocked rounds in a session and hands back to the human,
       so it can never trap the agent in a loop.
     - Never crashes the session: any internal error allows the stop and says why.
@@ -24,8 +25,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from proof_kit.common import (  # noqa: E402
-    STATE_DIR, find_root, git_has_changes, load_config, load_state, read_hook_input, run_checks,
-    save_state,
+    STATE_DIR, changed_this_turn, find_root, git_has_changes, load_config, load_state, read_hook_input,
+    run_checks, save_state,
 )
 
 
@@ -83,10 +84,14 @@ def decide(hook_input: Dict[str, Any]) -> int:
     if not hook.get("enabled", True) or not config.get("checks"):
         return 0
 
-    if hook.get("only_if_changed", True) and git_has_changes(root) is False:
-        return 0
-
     session = str(hook_input.get("session_id") or "default")
+    if hook.get("only_if_changed", True):
+        changed = changed_this_turn(root, session)
+        if changed is None:  # no record of the turn's start: fall back to "anything uncommitted"
+            changed = git_has_changes(root)
+        if changed is False:
+            return 0
+
     state = load_state(root)
     attempts = int(state.get(session, 0))
     max_attempts = int(hook.get("max_attempts", 3))

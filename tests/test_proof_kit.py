@@ -14,9 +14,10 @@ KIT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(KIT))
 
 from proof_kit import proof_init  # noqa: E402
-from proof_kit.common import _tail, load_config, parse_toml, read_hook_input  # noqa: E402
+from proof_kit.common import _tail, load_config, parse_toml, read_hook_input, tree_fingerprint  # noqa: E402
 
 HOOK = KIT / "proof_kit" / "verify_before_stop.py"
+TURN = KIT / "proof_kit" / "turn_start.py"
 PY = sys.executable
 PASS = f'"{PY}" -c "print(\'ok\')"'
 FAIL = f'"{PY}" -c "import sys; print(\'4 tests failed\'); sys.exit(1)"'
@@ -43,6 +44,11 @@ class Project:
     def stop(self, session: str = "s1"):
         payload = json.dumps({"cwd": str(self.root), "session_id": session, "stop_hook_active": False})
         return subprocess.run([PY, str(HOOK)], input=payload, capture_output=True, text=True, timeout=120)
+
+    def prompt(self, session: str = "s1"):
+        """What Claude Code does when the user sends a message: the UserPromptSubmit hook runs."""
+        payload = json.dumps({"cwd": str(self.root), "session_id": session, "prompt": "hi"})
+        return subprocess.run([PY, str(TURN)], input=payload, capture_output=True, text=True, timeout=60)
 
     def evidence(self) -> str:
         return (self.root / ".proof" / "last-run.md").read_text(encoding="utf-8")
@@ -123,6 +129,79 @@ class StopHookTests(unittest.TestCase):
         payload = json.dumps({"cwd": str(p.root), "session_id": "s1"}).encode("utf-8")
         r = subprocess.run([PY, str(HOOK)], input=b"\xef\xbb\xbf" + payload, capture_output=True, timeout=120)
         self.assertEqual(r.returncode, 2, r.stderr)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class TurnBaselineTests(unittest.TestCase):
+    """The Stop hook only runs the checks when something changed during the turn."""
+
+    def make(self, *args, **kwargs) -> Project:
+        p = Project(*args, **kwargs)
+        self.addCleanup(p.cleanup)
+        return p
+
+    def test_question_only_turn_skips_checks_even_with_uncommitted_work(self):
+        p = self.make({"test": FAIL})  # app.py is uncommitted, and the check fails
+        r = p.prompt()
+        self.assertEqual((r.returncode, r.stdout), (0, ""), "the turn hook is silent and never blocks")
+        r = p.stop()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((p.root / ".proof" / "last-run.md").exists(), "checks didn't run")
+
+    def test_edit_during_the_turn_runs_checks(self):
+        p = self.make({"test": FAIL})
+        p.prompt()
+        (p.root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertEqual(p.stop().returncode, 2)
+
+    def test_new_file_during_the_turn_runs_checks(self):
+        p = self.make({"test": FAIL}, changed=False)
+        p.prompt()
+        (p.root / "new.py").write_text("y = 1\n", encoding="utf-8")
+        self.assertEqual(p.stop().returncode, 2)
+
+    def test_blocked_round_then_fix_in_the_same_turn(self):
+        p = self.make({"test": FAIL})
+        p.prompt()
+        (p.root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertEqual(p.stop().returncode, 2)
+        (p.root / "proof.toml").write_text(f"[checks]\ntest = {json.dumps(PASS)}\n", encoding="utf-8")
+        self.assertEqual(p.stop().returncode, 0)
+
+    def test_next_turn_starts_clean(self):
+        p = self.make({"test": FAIL})
+        p.prompt()
+        (p.root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        p.stop()
+        p.prompt()  # the user asks a follow-up question; nothing changes
+        r = p.stop()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_turns_are_per_session(self):
+        p = self.make({"test": FAIL})
+        p.prompt("a")
+        (p.root / "app.py").write_text("x = 2\n", encoding="utf-8")
+        p.prompt("b")
+        self.assertEqual(p.stop("a").returncode, 2, "session a changed something")
+        self.assertEqual(p.stop("b").returncode, 0, "session b didn't")
+
+    def test_without_a_turn_record_falls_back_to_uncommitted_changes(self):
+        p = self.make({"test": FAIL})
+        self.assertEqual(p.stop().returncode, 2)
+
+    def test_fingerprint(self):
+        p = self.make({"test": PASS}, changed=False)
+        first = tree_fingerprint(p.root)
+        self.assertEqual(first, tree_fingerprint(p.root), "stable when nothing changes")
+        (p.root / ".proof").mkdir()
+        (p.root / ".proof" / "x.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(first, tree_fingerprint(p.root), "ignores .proof/")
+        (p.root / "notes.txt").write_text("a", encoding="utf-8")
+        second = tree_fingerprint(p.root)
+        self.assertNotEqual(first, second)
+        (p.root / "notes.txt").write_text("b", encoding="utf-8")
+        self.assertNotEqual(second, tree_fingerprint(p.root), "untracked file content counts")
+        self.assertIsNone(tree_fingerprint(Path(tempfile.mkdtemp())), "None outside a repo")
 
 
 class HookInputTests(unittest.TestCase):
@@ -222,6 +301,9 @@ class InitTests(unittest.TestCase):
         self.assertEqual(len(ours), 1, "re-running init does not duplicate the hook")
         self.assertEqual(len(commands), 2, "the user's own Stop hook is kept")
         self.assertTrue(Path(ours[0]["command"]).name.startswith("py"))
+        turn = [h for g in settings["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
+        self.assertEqual([h["args"] for h in turn], [[proof_init.TURN_ARG]], "one turn hook, not duplicated")
+        self.assertTrue((root / ".claude" / "proof-kit" / "proof_kit" / "turn_start.py").is_file())
 
     def test_installed_copy_runs_as_a_hook(self):
         if not shutil.which("git"):

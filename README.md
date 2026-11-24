@@ -24,7 +24,8 @@ Fix the cause (do not skip, delete or weaken tests), re-run the checks, then fin
 ```
 
 It never traps the agent: after 3 blocked rounds (configurable) it hands back to you and says which
-tests still fail. It only runs when git shows changed files, and any internal error lets the agent stop
+tests still fail. It only runs when files changed during the turn (so questions and reviews never trigger it), and any
+internal error lets the agent stop
 rather than break your session.
 
 ## What's included
@@ -94,7 +95,7 @@ test = "npm test --silent"
 [stop_hook]
 enabled = true
 max_attempts = 3        # after this many blocked rounds, hand back to the human
-only_if_changed = true  # skip when git shows no changed files
+only_if_changed = true  # skip when nothing changed during the turn
 timeout_seconds = 300   # per check
 ```
 
