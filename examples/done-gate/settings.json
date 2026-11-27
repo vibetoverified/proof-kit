@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/done-gate.mjs", "npm test --silent"],
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -34,6 +34,7 @@ rather than break your session.
 - **prove-it skill**: run the checks, add a test for the change, report with evidence
 - **handoff skill**: end-of-session summary of what changed, the proof, risks and next steps
 - **Setup** that detects Node (npm, pnpm, yarn, bun) and Python (pytest) projects
+- **[examples/done-gate](examples/done-gate)**: the same idea as a single 31-line Node script you can read in a minute and adapt to any stack
 
 Plain Python 3.9+, standard library only. Tested on Windows 11, macOS and Linux. No network calls, no
 telemetry.
